@@ -2,18 +2,20 @@
 # =============================
 # check_sc_continent_snmp.pl
 # Monitoring plugin for Security Code Continent servers
-# Version: 1.8.0
+# Version: 1.8.1
 # History:
 #   1.8.0 [2025-08-11] Added IPS monitoring mode
+#   1.8.1 [2025-09-05] Replaced custom shell_quote with String::ShellQuote
 # =============================
 
 use strict;
 use warnings;
 use Getopt::Long;
 use Pod::Usage;
+use String::ShellQuote;
 
 # ========== CONSTANTS ==========
-my $VERSION = "1.8.0";
+my $VERSION = "1.8.1";
 my $SNMPGET = '/usr/bin/snmpget';
 my $SNMPWALK = '/usr/bin/snmpwalk';
 
@@ -424,11 +426,6 @@ sub snmp_walk {
     return ($output, undef);
 }
 
-sub shell_quote {
-    my ($arg) = @_;
-    return "'" . $arg . "'" if $arg =~ /[^a-zA-Z0-9_\-]/;
-    return $arg;
-}
 
 sub parse_threshold {
     my ($threshold) = @_;
