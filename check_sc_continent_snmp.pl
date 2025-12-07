@@ -2,10 +2,11 @@
 # =============================
 # check_sc_continent_snmp.pl
 # Monitoring plugin for Security Code Continent servers
-# Version: 1.8.1
+# Version: 1.9.0
 # History:
 #   1.8.0 [2025-08-11] Added IPS monitoring mode
 #   1.8.1 [2025-09-05] Replaced custom shell_quote with String::ShellQuote
+#   1.9.0 [2025-10-27] Added Multi-WAN monitoring mode
 # =============================
 
 use strict;
@@ -15,7 +16,7 @@ use Pod::Usage;
 use String::ShellQuote;
 
 # ========== CONSTANTS ==========
-my $VERSION = "1.8.1";
+my $VERSION = "1.9.0";
 my $SNMPGET = '/usr/bin/snmpget';
 my $SNMPWALK = '/usr/bin/snmpwalk';
 
@@ -71,6 +72,11 @@ my %OIDS = (
     
     # IPS mode
     ipsComponentState => '1.3.6.1.4.1.34849.1.1.1.1.2.0',
+    
+    # Multi-WAN mode
+    contWANConnectionId     => '1.3.6.1.4.1.34849.1.1.1.5.5.1.2',
+    contWANConnectionGw     => '1.3.6.1.4.1.34849.1.1.1.5.5.1.3',
+    contWANConnectionStatus => '1.3.6.1.4.1.34849.1.1.1.5.5.1.7',
 );
 
 # ========== NAGIOS STATUS CODES ==========
@@ -302,6 +308,9 @@ elsif ($mode eq 'ips') {
     }
     $ips_not_running_status = lc($ips_not_running_status);
 }
+elsif ($mode eq 'multiwan') {
+    # No specific options for multiwan mode
+}
 else {
     print "UNKNOWN: Unsupported mode '$mode'\n";
     exit UNKNOWN;
@@ -334,6 +343,9 @@ elsif ($mode eq 'firewall') {
 }
 elsif ($mode eq 'ips') {
     check_ips();
+}
+elsif ($mode eq 'multiwan') {
+    check_multiwan();
 }
 
 exit OK;
@@ -534,6 +546,139 @@ sub format_seconds {
     push @parts, "$minutes minutes" if $minutes > 0;
 
     return join(', ', @parts);
+}
+
+# ========== Multi-WAN monitoring subroutine ==========
+sub check_multiwan {
+    my %wan_connections;
+    
+    # Get WAN Connection IDs
+    my ($result, $error) = snmp_walk($OIDS{contWANConnectionId});
+    if (defined $error) {
+        print "UNKNOWN: Failed to retrieve WAN connection IDs: $error\n";
+        exit UNKNOWN;
+    }
+    
+    # Extract indices and connection IDs
+    foreach my $line (split(/\n/, $result)) {
+        if ($line =~ /\.(\d+)\s+=\s+(\d+)/) {
+            my $index = $1;
+            $wan_connections{$index}{'id'} = $2;
+        }
+    }
+    
+    # Get WAN Connection Gateways
+    ($result, $error) = snmp_walk($OIDS{contWANConnectionGw});
+    if (defined $error) {
+        print "UNKNOWN: Failed to retrieve WAN connection gateways: $error\n";
+        exit UNKNOWN;
+    }
+    
+    foreach my $line (split(/\n/, $result)) {
+        if ($line =~ /\.(\d+)\s+=\s+"?([^"]+)"?/) {
+            my $index = $1;
+            my $gateway = $2;
+            if (exists $wan_connections{$index}) {
+                $wan_connections{$index}{'gw'} = $gateway;
+            }
+        }
+    }
+    
+    # Get WAN Connection Status
+    ($result, $error) = snmp_walk($OIDS{contWANConnectionStatus});
+    if (defined $error) {
+        print "UNKNOWN: Failed to retrieve WAN connection status: $error\n";
+        exit UNKNOWN;
+    }
+    
+    foreach my $line (split(/\n/, $result)) {
+        if ($line =~ /\.(\d+)\s+=\s+"?([^"]+)"?/) {
+            my $index = $1;
+            my $status = $2;
+            if (exists $wan_connections{$index}) {
+                $wan_connections{$index}{'status'} = $status;
+            }
+        }
+    }
+    
+    # Analyze WAN connections
+    my $total_connections = scalar keys %wan_connections;
+    my $active_connections = 0;
+    my $failed_connections = 0;
+    my @output_lines;
+    my $perfdata = "";
+    
+    foreach my $index (sort keys %wan_connections) {
+        my $conn = $wan_connections{$index};
+        
+        if (!defined $conn->{'id'} || !defined $conn->{'gw'} || !defined $conn->{'status'}) {
+            print "UNKNOWN: Incomplete data for WAN connection index $index\n";
+            exit UNKNOWN;
+        }
+        
+        my $connection_id = $conn->{'id'};
+        my $gateway = $conn->{'gw'};
+        my $status = $conn->{'status'};
+        
+        # Determine connection state
+        my $is_active = ($status eq 'ACTIVE') ? 1 : 0;
+        my $state_code = $is_active ? 1 : 0;
+        
+        # Add to performance data
+        $perfdata .= " 'wan.$connection_id.gateway.$gateway.status'=$state_code";
+        
+        # Count connections by status
+        if ($is_active) {
+            $active_connections++;
+        } else {
+            $failed_connections++;
+        }
+        
+        # Determine status for this connection
+        my $conn_status;
+        my $conn_code;
+        if ($is_active) {
+            $conn_status = 'OK';
+            $conn_code = 0;
+        } else {
+            $conn_status = 'WARNING';
+            $conn_code = 1;
+        }
+        
+        push @output_lines, "\\_ [$conn_status] $connection_id WAN Connection (GW:$gateway) status: " . lc($status);
+    }
+    
+    # Determine overall status
+    my $exit_code;
+    my $output;
+    
+    if ($failed_connections == 0) {
+        $output = "[OK] $total_connections WAN connections are ok\n";
+        $exit_code = OK;
+    } elsif ($failed_connections == $total_connections) {
+        $output = "[CRITICAL] All WAN connections in failed status\n";
+        $exit_code = CRITICAL;
+        # Update all connection statuses to CRITICAL
+        @output_lines = ();
+        foreach my $index (sort keys %wan_connections) {
+            my $conn = $wan_connections{$index};
+            push @output_lines, "\\_ [CRITICAL] $conn->{'id'} WAN Connection (GW:$conn->{'gw'}) status: " . lc($conn->{'status'});
+        }
+    } else {
+        $output = "[WARNING] $failed_connections WAN connection in failed status\n";
+        $exit_code = WARNING;
+    }
+    
+    $output .= join("\n", @output_lines);
+    
+    # Output results
+    if ($perfdata) {
+        print "$output |$perfdata\n";
+    } else {
+        print "$output\n";
+    }
+    
+    exit $exit_code;
 }
 
 sub check_sensors {
@@ -1766,6 +1911,9 @@ check_sc_continent_snmp.pl - Monitoring plugin for Security Code Continent serve
 
 =head1 SYNOPSIS
 
+  # Multi-WAN mode
+  ./check_sc_continent_snmp.pl --mode multiwan -H 192.168.1.100
+
   # Sensors mode
   ./check_sc_continent_snmp.pl --mode sensors -H 192.168.1.100 \
     --warning-cpu=70 --critical-cpu=80 \
@@ -1824,6 +1972,7 @@ check_sc_continent_snmp.pl - Monitoring plugin for Security Code Continent serve
 
 This plugin monitors various components of Security Code Continent servers
 using SNMP. Supports multiple modes:
+- 'multiwan': Multi-WAN connections status monitoring
 - 'sensors': Temperature monitoring
 - 'cpu': CPU load monitoring
 - 'memory': RAM usage monitoring
@@ -1842,7 +1991,7 @@ This plugin uses the external `snmpget` and `snmpwalk` commands from the net-snm
 
 =item B<--mode|-m>
 
-Operation mode: 'sensors', 'cpu', 'memory', 'swap', 'storage', 'system', 'cluster', 'firewall', or 'ips'
+Operation mode: 'multiwan', 'sensors', 'cpu', 'memory', 'swap', 'storage', 'system', 'cluster', 'firewall', or 'ips'
 
 =item B<--host|-H>
 
@@ -2044,6 +2193,9 @@ Print plugin version
 =back
 
 =head1 EXAMPLES
+
+  # Multi-WAN mode
+  ./check_sc_continent_snmp.pl -h 192.168.1.1 -C public -m multiwan
 
   # Sensors mode with verbose output
   ./check_sc_continent_snmp.pl --mode sensors -H 10.10.1.5 \
