@@ -250,5 +250,8 @@ Examples for all modes:
       ./check_sc_continent_snmp.pl --mode ips -H 192.168.1.100 \
         --ips-not-running=warning
 
+      # Multi-WAN mode
+      ./check_sc_continent_snmp.pl -h 192.168.1.1 -C public -m multiwan
+
 
 ```
